@@ -1,0 +1,328 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#
+require 'ipaddr'
+
+Vagrant.configure("2") do |config|
+
+  # PLUGINS
+  config.vagrant.plugins = {
+    'vagrant-libvirt' => {:version => '~> 0.8.1'},
+  }
+
+  # COMMON VM CONFIG
+  config.vm.boot_timeout = ENV['TEST_VM_BOOT_TIMEOUT'] || 600 # seconds
+  config.vm.graceful_halt_timeout = ENV['TEST_VM_HALT_TIMEOUT'] || 120 # seconds
+  config.vm.synced_folder '.', '/vagrant', disabled: true
+
+  # INIT
+  NETWORK_CIDR = IPAddr.new(ENV.fetch 'TEST_NETWORK_CIDR', '192.168.192.0/24')
+  NETWORK_ADDR = NETWORK_CIDR.mask(32).to_s
+  NETWORK_MASK = IPAddr.new("255.255.255.255").mask(NETWORK_CIDR.prefix).to_s
+  NETWORK_NAME = ENV.fetch 'TEST_NETWORK_NAME', 'harvester'
+  NETWORK_MODE = ENV.fetch 'TEST_NETWORK_MODE', 'route'
+
+  INSTALL_VERSION = ENV.fetch 'TEST_INSTALL_VERSION', 'v1.0.0'
+  UPGRADE_VERSION = ENV.fetch 'TEST_UPGRADE_VERSION', 'v1.0.1'
+
+  CLUSTER_TOKEN = ENV.fetch 'TEST_CLUSTER_TOKEN', NETWORK_NAME
+
+  SEED_IP = (NETWORK_CIDR.mask(32) | 0xFE).to_s
+  SEED_GW = (NETWORK_CIDR.mask(32) | 0x01).to_s
+  SEED_ISO_FILE = 'harvester-amd64.iso'
+  SEED_INITRD_FILE = 'harvester-initrd-amd64'
+  SEED_KERNEL_FILE = 'harvester-vmlinuz-amd64'
+  SEED_ROOTFS_FILE = 'harvester-rootfs-amd64.squashfs'
+  CONFIG_INIT_FILE = 'harvester-config-init.yaml'
+  CONFIG_JOIN_FILE = 'harvester-config-join.yaml'
+
+  NODES = ENV.fetch('NODES', ENV.fetch('N','1')).to_i # number of harvester nodes
+
+  NODE_NIC = ENV['TEST_NODE_NIC'] || 'e1000'
+  NODE_CPUS = ENV['TEST_NODE_CPUS'] || 4
+  NODE_MEMORY = ENV['TEST_NODE_MEMORY'] || 8192
+  NODE_FIRMWARE = ENV['TEST_NODE_FIRMWARE'] || '/usr/share/ovmf/OVMF.fd'
+  NODE_DISK_SIZE = ENV['TEST_NODE_DISK_SIZE'] || '150G'
+  NODE_DISK_TYPE = ENV['TEST_NODE_DISK_TYPE'] || 'qcow2'
+  NODE_DISK_DEVICE = ENV['TEST_NODE_DISK_DEVICE'] || 'vda'
+  NODE_DISK_ADAPTER = ENV['TEST_NODE_DISK_ADAPTER'] || 'virtio'
+  NODE_IMAGE_PREFIX = 'harvester-e2e-upgrade-'
+
+  MAC_PREFIX = ENV['TEST_MAC_PREFIX'] || '02:00:00:03:3D'
+
+  NETWORK_NODES = {
+    'vip' => {'ip' => (NETWORK_CIDR.mask(32) | 200).to_s, 'mac' => sprintf('%s:%s', MAC_PREFIX, '%02X' % (200 & 0xFF))},
+  }
+  NODES.times do |n|
+    x = 101 + n
+    NETWORK_NODES["node-#{n+1}"] = {
+      'ip'  => (NETWORK_CIDR.mask(32) | x).to_s,
+      'mac' => sprintf('%s:%s', MAC_PREFIX, '%02X' % (x & 0xFF)),
+    }
+  end
+
+  # SEED NODE (iPXE + DHCP)
+  config.vm.define 'seed', primary: true do |node|
+    node.vm.hostname = 'seed'
+    node.vm.box = 'opensuse/Leap-15.3.x86_64'
+
+    node.vm.network :private_network, ip: SEED_IP,
+      libvirt__network_name: NETWORK_NAME,
+      libvirt__forward_mode: NETWORK_MODE,
+      libvirt__dhcp_enabled: false
+
+    node.vm.provider :libvirt do |libvirt|
+      libvirt.cpus = 1
+      libvirt.memory = 1024
+      libvirt.nic_model_type = NODE_NIC
+      libvirt.default_prefix = NODE_IMAGE_PREFIX
+    end
+
+    node.vm.provision 'packages', type: 'shell', run: 'once' do |sh|
+      sh.inline = <<~SHELL
+        #!/usr/bin/env bash
+        set -eux -o pipefail
+        zypper install -y \
+          curl \
+          dhcp-server \
+          ipxe-bootimgs \
+          nginx \
+          tftp
+      SHELL
+    end
+
+    CONTENT_PATH = sprintf 'harvester/%s', INSTALL_VERSION
+    CONTENT_ROOT = sprintf '/srv/www/htdocs/%s', CONTENT_PATH
+
+    node.vm.provision 'artifacts', type: 'shell', run: 'once' do |sh|
+      sh.inline = <<~SHELL
+        #!/usr/bin/env bash
+        set -eux -o pipefail
+        mkdir -vp #{CONTENT_ROOT}
+        curl -fsSL --output #{CONTENT_ROOT}/#{SEED_ISO_FILE} \
+          https://releases.rancher.com/harvester/#{INSTALL_VERSION}/harvester-#{INSTALL_VERSION}-amd64.iso
+        curl -fsSL --output  #{CONTENT_ROOT}/#{SEED_INITRD_FILE} \
+          https://releases.rancher.com/harvester/#{INSTALL_VERSION}/harvester-#{INSTALL_VERSION}-initrd-amd64
+        curl -fsSL --output  #{CONTENT_ROOT}/#{SEED_KERNEL_FILE} \
+          https://releases.rancher.com/harvester/#{INSTALL_VERSION}/harvester-#{INSTALL_VERSION}-vmlinuz-amd64
+        curl -fsSL --output  #{CONTENT_ROOT}/#{SEED_ROOTFS_FILE} \
+          https://releases.rancher.com/harvester/#{INSTALL_VERSION}/harvester-#{INSTALL_VERSION}-rootfs-amd64.squashfs
+      SHELL
+    end
+
+    node.vm.provision 'config-dhcpd', type: 'shell', run: 'once' do |sh|
+      sh.inline = <<~SHELL
+        #!/usr/bin/env bash
+        set -eux -o pipefail
+        mkdir -vp /etc/dhcpd.d
+        echo '#{NETWORK_NODES}'
+        cat << 'CONF' > /etc/dhcpd.conf
+option space ipxe;
+option ipxe-encap-opts code 175 = encapsulate ipxe;
+option ipxe.priority code 1 = signed integer 8;
+option ipxe.keep-san code 8 = unsigned integer 8;
+option ipxe.skip-san-boot code 9 = unsigned integer 8;
+option ipxe.syslogs code 85 = string;
+option ipxe.cert code 91 = string;
+option ipxe.privkey code 92 = string;
+option ipxe.crosscert code 93 = string;
+option ipxe.no-pxedhcp code 176 = unsigned integer 8;
+option ipxe.bus-id code 177 = string;
+option ipxe.san-filename code 188 = string;
+option ipxe.bios-drive code 189 = unsigned integer 8;
+option ipxe.username code 190 = string;
+option ipxe.password code 191 = string;
+option ipxe.reverse-username code 192 = string;
+option ipxe.reverse-password code 193 = string;
+option ipxe.version code 235 = string;
+option iscsi-initiator-iqn code 203 = string;
+# Feature indicators
+option ipxe.pxeext code 16 = unsigned integer 8;
+option ipxe.iscsi code 17 = unsigned integer 8;
+option ipxe.aoe code 18 = unsigned integer 8;
+option ipxe.http code 19 = unsigned integer 8;
+option ipxe.https code 20 = unsigned integer 8;
+option ipxe.tftp code 21 = unsigned integer 8;
+option ipxe.ftp code 22 = unsigned integer 8;
+option ipxe.dns code 23 = unsigned integer 8;
+option ipxe.bzimage code 24 = unsigned integer 8;
+option ipxe.multiboot code 25 = unsigned integer 8;
+option ipxe.slam code 26 = unsigned integer 8;
+option ipxe.srp code 27 = unsigned integer 8;
+option ipxe.nbi code 32 = unsigned integer 8;
+option ipxe.pxe code 33 = unsigned integer 8;
+option ipxe.elf code 34 = unsigned integer 8;
+option ipxe.comboot code 35 = unsigned integer 8;
+option ipxe.efi code 36 = unsigned integer 8;
+option ipxe.fcoe code 37 = unsigned integer 8;
+option ipxe.vlan code 38 = unsigned integer 8;
+option ipxe.menu code 39 = unsigned integer 8;
+option ipxe.sdi code 40 = unsigned integer 8;
+option ipxe.nfs code 41 = unsigned integer 8;
+# disable proxydhcp delay
+option ipxe.no-pxedhcp 1;
+
+ddns-update-style none;
+
+option arch code 93 = unsigned integer 16;
+option user-class code 77 = string;
+
+default-lease-time 600;
+max-lease-time 7200;
+authoritative;
+log-facility local7;
+
+subnet #{NETWORK_ADDR} netmask #{NETWORK_MASK} {
+    range #{(NETWORK_CIDR.mask(32) | 201).to_s} #{(NETWORK_CIDR.mask(32) | 251).to_s};
+    option domain-name-servers #{SEED_IP}, 8.8.8.8;
+    option routers #{SEED_GW};
+    next-server #{SEED_IP};
+
+   if exists user-class and option user-class = "iPXE" {
+        filename "http://#{SEED_IP}/#{CONTENT_PATH}/${net1/mac}";
+    } elsif option arch != 00:00 {
+        filename "ipxe/ipxe.efi";
+    } else {
+        filename "ipxe/undionly.kpxe";
+    }
+}
+
+host harvest-vip {
+    hardware ethernet #{NETWORK_NODES['vip']['mac'].downcase};
+    fixed-address #{NETWORK_NODES['vip']['ip']};
+}
+CONF
+      SHELL
+    end
+
+    NODES.times do |n|
+      NODE_NAME = "node-#{n+1}"
+      node.vm.provision "config-dhcp-#{NODE_NAME}", type: 'shell', run: 'once' do |sh|
+        sh.inline = <<~SHELL
+          #!/usr/bin/env bash
+          set -eux -o pipefail
+          cat << CONF > /etc/dhcpd.d/#{NODE_NAME}.conf
+host harvester-#{NODE_NAME} {
+    hardware ethernet #{NETWORK_NODES[NODE_NAME]['mac'].downcase};
+    fixed-address #{NETWORK_NODES[NODE_NAME]['ip']};
+}
+CONF
+          echo 'include "/etc/dhcpd.d/#{NODE_NAME}.conf";' >> /etc/dhcpd.conf
+        SHELL
+      end
+      node.vm.provision "config-ipxe-#{NODE_NAME}", type: 'shell', run: 'once' do |sh|
+        sh.inline = <<~SHELL
+          #!/usr/bin/env bash
+          set -eux -o pipefail
+          cat << IPXE > #{CONTENT_ROOT}/#{NETWORK_NODES[NODE_NAME]['mac'].downcase}
+#!ipxe
+kernel http://#{SEED_IP}/#{CONTENT_PATH}/#{SEED_KERNEL_FILE}
+initrd http://#{SEED_IP}/#{CONTENT_PATH}/#{SEED_INITRD_FILE}
+imgargs #{SEED_KERNEL_FILE} initrd=#{SEED_INITRD_FILE} ip=ens5:dhcp net.ifnames=1 rd.cos.disable rd.live.debug=1 rd.noverifyssl root=live:http://#{SEED_IP}/#{CONTENT_PATH}/#{SEED_ROOTFS_FILE} console=tty1 harvester.install.automatic=true harvester.install.config_url=http://#{SEED_IP}/#{CONTENT_PATH}/#{n==0 ? CONFIG_INIT_FILE : CONFIG_JOIN_FILE} harvester.os.hostname=#{NODE_NAME}
+boot
+IPXE
+        SHELL
+      end
+    end
+
+    node.vm.provision CONFIG_INIT_FILE, type: 'shell', run: 'once' do |sh|
+      sh.inline = <<~SHELL
+        #/usr/bin/env bash
+cat<<YAML > #{CONTENT_ROOT}/#{CONFIG_INIT_FILE}
+token: #{CLUSTER_TOKEN}
+os:
+  ssh_authorized_keys: [#{ENV['TEST_SSH_AUTHORIZED_KEYS']}]
+  ntp_servers: [#{ENV['TEST_NTP_SERVERS'] || '"0.suse.pool.ntp.org", "1.suse.pool.ntp.org"'}]
+  password: #{ENV['TEST_VM_PASSWORD'] || 'rancher'}
+install:
+  mode: create
+  networks:
+    harvester-mgmt:
+      interfaces:
+      - name: ens6
+      method: dhcp
+    bond0:
+      interfaces:
+      - name: ens5
+      method: dhcp
+  device: /dev/#{NODE_DISK_DEVICE}
+  iso_url: http://#{SEED_IP}/#{CONTENT_PATH}/#{SEED_ISO_FILE}
+  tty: ttyS0
+  vip: #{NETWORK_NODES['vip']['ip']}
+  vip_mode: DHCP
+  vip_hw_addr: #{NETWORK_NODES['vip']['mac']}
+YAML
+      SHELL
+    end
+
+    node.vm.provision CONFIG_JOIN_FILE, type: 'shell', run: 'once' do |sh|
+      sh.inline = <<~SHELL
+        #/usr/bin/env bash
+cat<<YAML > #{CONTENT_ROOT}/#{CONFIG_JOIN_FILE}
+server_url: https://#{NETWORK_NODES['vip']['ip']}:443
+token: #{CLUSTER_TOKEN}
+os:
+  ssh_authorized_keys: [#{ENV['TEST_SSH_AUTHORIZED_KEYS']}]
+  ntp_servers: [#{ENV['TEST_NTP_SERVERS'] || '"0.suse.pool.ntp.org", "1.suse.pool.ntp.org"'}]
+  password: #{ENV['TEST_VM_PASSWORD'] || 'rancher'}
+install:
+  mode: join
+  networks:
+    harvester-mgmt:
+      interfaces:
+      - name: ens6
+      method: dhcp
+    bond0:
+      interfaces:
+      - name: ens5
+      method: dhcp
+  device: /dev/#{NODE_DISK_DEVICE}
+  iso_url: http://#{SEED_IP}/#{CONTENT_PATH}/#{SEED_ISO_FILE}
+  tty: ttyS0
+YAML
+      SHELL
+    end
+
+    node.vm.provision 'services', type: 'shell', run: 'once' do |sh|
+      sh.inline = <<~SHELL
+        #!/usr/bin/env bash
+        set -eux -o pipefail
+        mkdir -vp /srv/tftpboot/ipxe
+        chmod -R ugo+rw /srv/tftpboot
+        id dhcpd || useradd -r -u 469 -s /sbin/nologin -M -d /var/lib/dhcp dhcpd
+        cat <<ENV >> /etc/sysconfig/dhcpd
+DHCPD_INTERFACE="eth1"
+ENV
+        cp -vf /usr/share/ipxe/ipxe-x86_64.efi /srv/tftpboot/ipxe/ipxe.efi
+        cp -vf /usr/share/ipxe/undionly.kpxe /srv/tftpboot/ipxe/undionly.kpxe
+        systemctl daemon-reload
+        systemctl enable --now tftp.socket
+        systemctl enable --now dhcpd
+        systemctl enable --now nginx
+      SHELL
+    end
+  end
+
+  # HARVESTER NODES
+  NODES.times do |n|
+    NODE_NAME = "node-#{n+1}"
+    NODE_MAC = NETWORK_NODES[NODE_NAME]['mac']
+    config.vm.define NODE_NAME do |node|
+      node.vm.hostname = NODE_NAME
+      node.vm.network :private_network, mac: NODE_MAC, libvirt__network_name: NETWORK_NAME
+      node.vm.provider :libvirt do |libvirt, override|
+        override.ssh.username = 'rancher'
+        override.ssh.password = ENV['TEST_VM_PASSWORD'] || 'rancher'
+        libvirt.cpus = NODE_CPUS
+        libvirt.memory = NODE_MEMORY
+        libvirt.nic_model_type = NODE_NIC
+        libvirt.nested = true
+        libvirt.boot 'hd'
+        libvirt.boot 'network' => NETWORK_NAME
+        libvirt.loader = NODE_FIRMWARE
+        libvirt.storage :file, type: NODE_DISK_TYPE, bus: NODE_DISK_ADAPTER, device: NODE_DISK_DEVICE, size: NODE_DISK_SIZE
+        libvirt.default_prefix = NODE_IMAGE_PREFIX
+      end
+    end
+  end
+end
