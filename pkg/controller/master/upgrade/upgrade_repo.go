@@ -26,6 +26,7 @@ import (
 
 	"github.com/harvester/harvester/pkg/apis/harvesterhci.io/v1beta1"
 	harvesterv1 "github.com/harvester/harvester/pkg/apis/harvesterhci.io/v1beta1"
+	"github.com/harvester/harvester/pkg/controller/master/upgrade/repoinfo"
 	"github.com/harvester/harvester/pkg/util"
 )
 
@@ -52,32 +53,6 @@ var (
 		"rancher/mirrored-fluent-fluent-bit",
 	}
 )
-
-type HarvesterRelease struct {
-	Harvester            string `yaml:"harvester,omitempty"`
-	HarvesterChart       string `yaml:"harvesterChart,omitempty"`
-	OS                   string `yaml:"os,omitempty"`
-	Kubernetes           string `yaml:"kubernetes,omitempty"`
-	Rancher              string `yaml:"rancher,omitempty"`
-	MonitoringChart      string `yaml:"monitoringChart,omitempty"`
-	MinUpgradableVersion string `yaml:"minUpgradableVersion,omitempty"`
-}
-
-type RepoInfo struct {
-	Release HarvesterRelease
-}
-
-func (info *RepoInfo) Marshall() (string, error) {
-	out, err := yaml.Marshal(info)
-	if err != nil {
-		return "", err
-	}
-	return string(out), nil
-}
-
-func (info *RepoInfo) Load(data string) error {
-	return yaml.Unmarshal([]byte(data), info)
-}
 
 type Repo struct {
 	ctx     context.Context
@@ -243,7 +218,7 @@ func (r *Repo) createVM(image *harvesterv1.VirtualMachineImage) (*kubevirtv1.Vir
 									BootOrder: &bootOrder,
 									DiskDevice: kubevirtv1.DiskDevice{
 										CDRom: &kubevirtv1.CDRomTarget{
-											Bus: "sata",
+											Bus: "scsi",
 										},
 									},
 									Name: "disk-0",
@@ -251,7 +226,7 @@ func (r *Repo) createVM(image *harvesterv1.VirtualMachineImage) (*kubevirtv1.Vir
 								{
 									DiskDevice: kubevirtv1.DiskDevice{
 										CDRom: &kubevirtv1.CDRomTarget{
-											Bus: "sata",
+											Bus: "scsi",
 										},
 									},
 									Name: "cloudinitdisk",
@@ -273,9 +248,6 @@ func (r *Repo) createVM(image *harvesterv1.VirtualMachineImage) (*kubevirtv1.Vir
 									Name:  "default",
 								},
 							},
-						},
-						Machine: &kubevirtv1.Machine{
-							Type: "q35",
 						},
 						Resources: kubevirtv1.ResourceRequirements{
 							Limits: corev1.ResourceList{
@@ -464,7 +436,7 @@ func (r *Repo) createService() (*corev1.Service, error) {
 	return r.h.serviceClient.Create(&service)
 }
 
-func (r *Repo) getInfo() (*RepoInfo, error) {
+func (r *Repo) getInfo() (*repoinfo.RepoInfo, error) {
 	releaseURL := fmt.Sprintf("http://%s.%s/harvester-iso/harvester-release.yaml", r.getRepoServiceName(), upgradeNamespace)
 
 	req, err := http.NewRequestWithContext(r.ctx, http.MethodGet, releaseURL, nil)
@@ -487,7 +459,7 @@ func (r *Repo) getInfo() (*RepoInfo, error) {
 		return nil, err
 	}
 
-	info := RepoInfo{}
+	info := repoinfo.RepoInfo{}
 	err = yaml.Unmarshal(body, &info.Release)
 	if err != nil {
 		return nil, err

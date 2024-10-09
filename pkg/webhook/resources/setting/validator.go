@@ -34,13 +34,19 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 
+	mapset "github.com/deckarep/golang-set/v2"
+
+	networkv1 "github.com/harvester/harvester-network-controller/pkg/apis/network.harvesterhci.io/v1beta1"
+	"github.com/harvester/harvester-network-controller/pkg/utils"
 	"github.com/harvester/harvester/pkg/apis/harvesterhci.io/v1beta1"
 	"github.com/harvester/harvester/pkg/containerd"
+	nodectl "github.com/harvester/harvester/pkg/controller/master/node"
 	settingctl "github.com/harvester/harvester/pkg/controller/master/setting"
 	storagenetworkctl "github.com/harvester/harvester/pkg/controller/master/storagenetwork"
 	ctlv1beta1 "github.com/harvester/harvester/pkg/generated/controllers/harvesterhci.io/v1beta1"
 	ctlkubevirtv1 "github.com/harvester/harvester/pkg/generated/controllers/kubevirt.io/v1"
 	ctllhv1b2 "github.com/harvester/harvester/pkg/generated/controllers/longhorn.io/v1beta2"
+	ctlnetworkv1 "github.com/harvester/harvester/pkg/generated/controllers/network.harvesterhci.io/v1beta1"
 	ctlsnapshotv1 "github.com/harvester/harvester/pkg/generated/controllers/snapshot.storage.k8s.io/v1"
 	"github.com/harvester/harvester/pkg/settings"
 	"github.com/harvester/harvester/pkg/util"
@@ -89,7 +95,6 @@ var validateSettingFuncs = map[string]validateSettingFunc{
 	settings.NTPServersSettingName:                             validateNTPServers,
 	settings.AutoRotateRKE2CertsSettingName:                    validateAutoRotateRKE2Certs,
 	settings.KubeconfigDefaultTokenTTLMinutesSettingName:       validateKubeConfigTTLSetting,
-	settings.UpgradeConfigSettingName:                          validateUpgradeConfig,
 	settings.AdditionalGuestMemoryOverheadRatioName:            validateAdditionalGuestMemoryOverheadRatio,
 }
 
@@ -110,7 +115,6 @@ var validateSettingUpdateFuncs = map[string]validateSettingUpdateFunc{
 	settings.NTPServersSettingName:                             validateUpdateNTPServers,
 	settings.AutoRotateRKE2CertsSettingName:                    validateUpdateAutoRotateRKE2Certs,
 	settings.KubeconfigDefaultTokenTTLMinutesSettingName:       validateUpdateKubeConfigTTLSetting,
-	settings.UpgradeConfigSettingName:                          validateUpdateUpgradeConfig,
 	settings.AdditionalGuestMemoryOverheadRatioName:            validateUpdateAdditionalGuestMemoryOverheadRatio,
 }
 
@@ -129,6 +133,9 @@ func NewValidator(
 	featureCache mgmtv3.FeatureCache,
 	lhVolumeCache ctllhv1b2.VolumeCache,
 	pvcCache ctlcorev1.PersistentVolumeClaimCache,
+	cnCache ctlnetworkv1.ClusterNetworkCache,
+	vcCache ctlnetworkv1.VlanConfigCache,
+	vsCache ctlnetworkv1.VlanStatusCache,
 ) types.Validator {
 	validator := &settingValidator{
 		settingCache:       settingCache,
@@ -141,6 +148,9 @@ func NewValidator(
 		featureCache:       featureCache,
 		lhVolumeCache:      lhVolumeCache,
 		pvcCache:           pvcCache,
+		cnCache:            cnCache,
+		vcCache:            vcCache,
+		vsCache:            vsCache,
 	}
 
 	validateSettingFuncs[settings.BackupTargetSettingName] = validator.validateBackupTarget
@@ -154,6 +164,9 @@ func NewValidator(
 
 	validateSettingFuncs[settings.HTTPProxySettingName] = validator.validateHTTPProxy
 	validateSettingUpdateFuncs[settings.HTTPProxySettingName] = validator.validateUpdateHTTPProxy
+
+	validateSettingFuncs[settings.UpgradeConfigSettingName] = validator.validateUpgradeConfig
+	validateSettingUpdateFuncs[settings.UpgradeConfigSettingName] = validator.validateUpdateUpgradeConfig
 
 	return validator
 }
@@ -171,6 +184,9 @@ type settingValidator struct {
 	featureCache       mgmtv3.FeatureCache
 	lhVolumeCache      ctllhv1b2.VolumeCache
 	pvcCache           ctlcorev1.PersistentVolumeClaimCache
+	cnCache            ctlnetworkv1.ClusterNetworkCache
+	vcCache            ctlnetworkv1.VlanConfigCache
+	vsCache            ctlnetworkv1.VlanStatusCache
 }
 
 func (v *settingValidator) Resource() types.Resource {
@@ -241,11 +257,14 @@ func validateHTTPProxyHelper(value string, nodes []*corev1.Node) error {
 		return err
 	}
 
-	// Make sure the node's IP addresses is set in 'noProxy'. These IP
-	// addresses can be specified individually or via CIDR address.
-	err := validateNoProxy(httpProxyConfig.NoProxy, nodes)
-	if err != nil {
-		return err
+	// Make sure the node's IP addresses are set in `NoProxy` if `HTTPProxy`
+	// or `HTTPSProxy` are configured. These IP addresses can be specified
+	// individually or via CIDR address.
+	if httpProxyConfig.HTTPProxy != "" || httpProxyConfig.HTTPSProxy != "" {
+		err := validateNoProxy(httpProxyConfig.NoProxy, nodes)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -262,8 +281,11 @@ func (v *settingValidator) validateHTTPProxy(setting *v1beta1.Setting) error {
 		}
 	}
 
-	if err := validateHTTPProxyHelper(setting.Value, nodes); err != nil {
-		return werror.NewInvalidError(err.Error(), settings.KeywordValue)
+	// Validate the value only if it is not the default value.
+	if setting.Value != setting.Default {
+		if err := validateHTTPProxyHelper(setting.Value, nodes); err != nil {
+			return werror.NewInvalidError(err.Error(), settings.KeywordValue)
+		}
 	}
 	return nil
 }
@@ -986,7 +1008,19 @@ func (v *settingValidator) validateStorageNetworkHelper(value string) error {
 		return err
 	}
 
-	return v.checkStorageNetworkRangeValid(&config)
+	if err := v.checkStorageNetworkRangeValid(&config); err != nil {
+		return err
+	}
+
+	if err := v.checkVlanStatusReady(&config); err != nil {
+		return err
+	}
+
+	if err := v.checkVCSpansAllNodes(&config); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (v *settingValidator) validateStorageNetwork(setting *v1beta1.Setting) error {
@@ -1092,10 +1126,38 @@ func (v *settingValidator) getSystemVolumes() (map[string]struct{}, error) {
 	return systemVolumes, nil
 }
 
+func (v *settingValidator) getVClusterVolumes() (map[string]struct{}, error) {
+	sets := labels.Set{
+		util.LablelVClusterAppNameKey: util.LablelVClusterAppNameValue,
+	}
+
+	pvcs, err := v.pvcCache.List(util.VClusterNamespace, sets.AsSelector())
+	if err != nil {
+		return nil, err
+	}
+
+	vClusterVolumes := make(map[string]struct{})
+	for _, pvc := range pvcs {
+		if pvc.Spec.VolumeName == "" {
+			continue
+		}
+		logrus.Debugf("Get vCluster volume %v", pvc.Spec.VolumeName)
+		vClusterVolumes[pvc.Spec.VolumeName] = struct{}{}
+	}
+
+	return vClusterVolumes, nil
+}
+
 func (v *settingValidator) checkOnlineVolume() error {
 	systemVolumes, err := v.getSystemVolumes()
 	if err != nil {
 		logrus.Errorf("getSystemVolumes err %v", err)
+		return err
+	}
+
+	vClusterVolumes, err := v.getVClusterVolumes()
+	if err != nil {
+		logrus.Errorf("getVClusterVolumes err %v", err)
 		return err
 	}
 
@@ -1109,11 +1171,14 @@ func (v *settingValidator) checkOnlineVolume() error {
 		if _, found := systemVolumes[volume.Name]; found {
 			continue
 		}
-
-		if volume.Status.State != lhv1beta2.VolumeStateDetached {
-			logrus.Errorf("volume %v in state %v", volume.Name, volume.Status.State)
-			return fmt.Errorf("please stop all workloads before configuring the storage-network setting")
+		if volume.Status.State == lhv1beta2.VolumeStateDetached {
+			continue
 		}
+		if _, found := vClusterVolumes[volume.Name]; found {
+			return fmt.Errorf("please stop vcluster before configuring the storage-network setting")
+		}
+		logrus.Errorf("volume %v in state %v", volume.Name, volume.Status.State)
+		return fmt.Errorf("please stop all workloads before configuring the storage-network setting")
 	}
 
 	return nil
@@ -1139,6 +1204,88 @@ func (v *settingValidator) checkStorageNetworkValueVaild() error {
 
 	if err := v.checkOnlineVolume(); err != nil {
 		return werror.NewInvalidError(err.Error(), settings.KeywordValue)
+	}
+
+	return nil
+}
+
+func (v *settingValidator) checkVlanStatusReady(config *storagenetworkctl.Config) error {
+	_, err := v.cnCache.Get(config.ClusterNetwork)
+	if err != nil {
+		return fmt.Errorf("cluster network %s not found because %v", config.ClusterNetwork, err)
+	}
+
+	vsList, err := v.vsCache.List(labels.Set{
+		utils.KeyClusterNetworkLabel: config.ClusterNetwork,
+	}.AsSelector())
+	if err != nil {
+		return err
+	}
+
+	if len(vsList) == 0 {
+		return fmt.Errorf("vlan status not present for cluster network %s", config.ClusterNetwork)
+	}
+
+	for _, vs := range vsList {
+		if networkv1.Ready.IsFalse(vs.Status) {
+			return fmt.Errorf("vs %s status is not Ready", vs.Name)
+		}
+	}
+
+	return nil
+}
+
+func getMatchNodes(vc *networkv1.VlanConfig) ([]string, error) {
+	if vc.Annotations == nil || vc.Annotations[utils.KeyMatchedNodes] == "" {
+		return nil, fmt.Errorf("vlan config annotations is absent for matched nodes")
+	}
+
+	var matchedNodes []string
+	if err := json.Unmarshal([]byte(vc.Annotations[utils.KeyMatchedNodes]), &matchedNodes); err != nil {
+		return nil, err
+	}
+
+	return matchedNodes, nil
+}
+
+func (v *settingValidator) checkVCSpansAllNodes(config *storagenetworkctl.Config) error {
+	matchedNodes := mapset.NewSet[string]()
+
+	vcs, err := v.vcCache.List(labels.Set{
+		utils.KeyClusterNetworkLabel: config.ClusterNetwork,
+	}.AsSelector())
+	if err != nil {
+		return err
+	}
+
+	if len(vcs) == 0 {
+		return fmt.Errorf("vlan config not present for cluster network %s", config.ClusterNetwork)
+	}
+
+	for _, vc := range vcs {
+		vnodes, err := getMatchNodes(vc)
+		if err != nil {
+			return err
+		}
+		matchedNodes.Append(vnodes...)
+	}
+
+	nodes, err := v.nodeCache.List(labels.Everything())
+	if err != nil {
+		return werror.NewInternalError(err.Error())
+	}
+
+	//check if vlanconfig contains all the nodes in the cluster
+	for _, node := range nodes {
+		//skip witness nodes which do not run LH Pods
+		isManagement := nodectl.IsManagementRole(node)
+		if nodectl.IsWitnessNode(node, isManagement) {
+			continue
+		}
+
+		if !matchedNodes.Contains(node.Name) {
+			return fmt.Errorf("vlanconfig does not span %s", node.Name)
+		}
 	}
 
 	return nil
@@ -1287,7 +1434,16 @@ func validateUpgradeConfigHelper(setting *v1beta1.Setting) (*settings.UpgradeCon
 	return config, nil
 }
 
-func validateUpgradeConfigFields(upgradeConfig *settings.UpgradeConfig) error {
+func validateUpgradeConfigFields(setting *v1beta1.Setting, isSingleNode bool) error {
+	upgradeConfig, err := validateUpgradeConfigHelper(setting)
+	if err != nil {
+		return err
+	}
+
+	if upgradeConfig == nil {
+		return nil
+	}
+
 	strategyType := upgradeConfig.PreloadOption.Strategy.Type
 
 	// Validate the image preload strategy type field
@@ -1303,24 +1459,24 @@ func validateUpgradeConfigFields(upgradeConfig *settings.UpgradeConfig) error {
 		return fmt.Errorf("invalid image preload concurrency: %d", concurrency)
 	}
 
+	// Validate the restore VM field
+	if upgradeConfig.RestoreVM && !isSingleNode {
+		return fmt.Errorf("restoreVM is only supported in single node cluster")
+	}
+
 	return nil
 }
 
-func validateUpgradeConfig(setting *v1beta1.Setting) error {
-	upgradeConfig, err := validateUpgradeConfigHelper(setting)
+func (v *settingValidator) validateUpgradeConfig(setting *v1beta1.Setting) error {
+	isSingleNode, err := v.isSingleNode()
 	if err != nil {
 		return err
 	}
-
-	if upgradeConfig == nil {
-		return nil
-	}
-
-	return validateUpgradeConfigFields(upgradeConfig)
+	return validateUpgradeConfigFields(setting, isSingleNode)
 }
 
-func validateUpdateUpgradeConfig(_ *v1beta1.Setting, newSetting *v1beta1.Setting) error {
-	return validateUpgradeConfig(newSetting)
+func (v *settingValidator) validateUpdateUpgradeConfig(_ *v1beta1.Setting, newSetting *v1beta1.Setting) error {
+	return v.validateUpgradeConfig(newSetting)
 }
 
 func validateAdditionalGuestMemoryOverheadRatio(newSetting *v1beta1.Setting) error {
@@ -1336,4 +1492,12 @@ func validateAdditionalGuestMemoryOverheadRatio(newSetting *v1beta1.Setting) err
 
 func validateUpdateAdditionalGuestMemoryOverheadRatio(_ *v1beta1.Setting, newSetting *v1beta1.Setting) error {
 	return validateAdditionalGuestMemoryOverheadRatio(newSetting)
+}
+
+func (v *settingValidator) isSingleNode() (bool, error) {
+	nodes, err := v.nodeCache.List(labels.Everything())
+	if err != nil {
+		return false, err
+	}
+	return len(nodes) == 1, nil
 }

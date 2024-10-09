@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	gversion "github.com/mcuadros/go-version"
@@ -150,17 +151,24 @@ func (s *versionSyncer) getExtraInfo() (map[string]string, error) {
 }
 
 func (s *versionSyncer) syncVersions(resp CheckUpgradeResponse, currentVersion string) error {
-	if err := s.cleanupVersions(currentVersion); err != nil {
+	if err := s.cleanupVersions(currentVersion, resp.Versions); err != nil {
 		return err
 	}
 
+	// iterate over response and identify if a new version needs to be created
 	for _, v := range resp.Versions {
 		newVersion, err := s.getNewVersion(v)
 		if err != nil {
+			if strings.Contains(err.Error(), "failed to download version") {
+				continue
+			}
 			return err
 		}
 
-		if !canUpgrade(currentVersion, newVersion) {
+		// newVersion CRD is created from the version.yaml created from the release artifact
+		// this needs to be changed to use the min version coming from the upgrade responder
+		// as this could be dynamically update and will cause cleanup of older versions
+		if !canUpgrade(currentVersion, newVersion, v) {
 			continue
 		}
 
@@ -175,21 +183,28 @@ func (s *versionSyncer) syncVersions(resp CheckUpgradeResponse, currentVersion s
 			}
 		}
 	}
+
 	return nil
 }
 
 // cleanupVersions remove version resources that's can't be upgraded to anymore
-func (s *versionSyncer) cleanupVersions(currentVersion string) error {
+func (s *versionSyncer) cleanupVersions(currentVersion string, remoteVersions []Version) error {
 	versions, err := s.versionClient.List(s.namespace, metav1.ListOptions{})
 	if err != nil {
 		return err
 	}
 
-	for i := range versions.Items {
-		v := versions.Items[i]
-		if !canUpgrade(currentVersion, &v) {
-			if err := s.versionClient.Delete(v.Namespace, v.Name, &metav1.DeleteOptions{}); err != nil {
-				return err
+	for _, version := range remoteVersions {
+		for i, v := range versions.Items {
+			versionObj := v
+			if !canUpgrade(currentVersion, &versionObj, version) {
+				if err := s.versionClient.Delete(v.Namespace, v.Name, &metav1.DeleteOptions{}); err != nil {
+					if apierrors.IsNotFound(err) {
+						continue // likely object has been removed so we can continue
+					}
+					return err
+				}
+				versions.Items = append(versions.Items[:i], versions.Items[i+1:]...)
 			}
 		}
 	}
@@ -231,13 +246,13 @@ func (s *versionSyncer) getNewVersion(v Version) (*harvesterv1.Version, error) {
 	return &newVersion, nil
 }
 
-func canUpgrade(currentVersion string, newVersion *harvesterv1.Version) bool {
+func canUpgrade(currentVersion string, newVersion *harvesterv1.Version, responderVersion Version) bool {
 	switch {
 	case newVersion.Spec.ISOURL == "" || newVersion.Spec.ISOChecksum == "":
 		return false
-	case slice.ContainsString(newVersion.Spec.Tags, "dev"):
+	case slice.ContainsString(responderVersion.Tags, "dev"):
 		return true
-	case gversion.Compare(currentVersion, newVersion.Name, "<") && (newVersion.Spec.MinUpgradableVersion == "" || gversion.Compare(currentVersion, newVersion.Spec.MinUpgradableVersion, ">=")):
+	case gversion.Compare(currentVersion, responderVersion.Name, "<") && (responderVersion.MinUpgradableVersion == "" || gversion.Compare(currentVersion, responderVersion.MinUpgradableVersion, ">=")):
 		return true
 	default:
 		return false
